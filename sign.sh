@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Debian 13 + Secure Boot: NVIDIA DKMS modüllerini imzala (MOK.key + MOK.der)
+# Debian 13 + Secure Boot: NVIDIA DKMS modüllerini imzala (otomatik bağımlılık kurulumu)
 set -e
 
-# ---- Root'a otomatik yüksel ----
+# --- Root'a otomatik yüksel ---
 if [ "$EUID" -ne 0 ]; then
   exec sudo -E bash "$0" "$@"
 fi
 
-# ---- Senin anahtar yolların ----
+# --- Senin anahtar yolların (MOK.key + MOK.der) ---
 KEY_PRIV="/home/safakb/mok/MOK.key"
 KEY_DER="/home/safakb/mok/MOK.der"
 
@@ -17,18 +17,39 @@ KEY_DER="/home/safakb/mok/MOK.der"
 KREL="$(uname -r)"
 KMAJMIN="$(uname -r | awk -F. '{print $1"."$2}')"
 
-# ---- kmodsign konumu ----
-KSIGN="/usr/lib/linux-kbuild-$KMAJMIN/kmodsign"
-if [ ! -x "$KSIGN" ]; then
-  if command -v kmodsign >/dev/null 2>&1; then
-    KSIGN="$(command -v kmodsign)"
+APT_INSTALL() {
+  # apt varsa sessiz kurulum
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y "$@"
   else
-    echo "HATA: kmodsign yok. Kur: apt update && apt install -y linux-kbuild-$KMAJMIN"
+    echo "HATA: apt bulunamadı. Bu script Debian/Ubuntu içindir."
     exit 1
   fi
+}
+
+# --- Bağımlılıkları kur: kmodsign (linux-kbuild), xz, zstd ---
+KSIGN="/usr/lib/linux-kbuild-$KMAJMIN/kmodsign"
+if [ ! -x "$KSIGN" ]; then
+  # Maj.Min sürüme göre dene, olmazsa sadece major (örn. 6) dene
+  APT_INSTALL "linux-kbuild-$KMAJMIN" || APT_INSTALL "linux-kbuild-$(echo "$KMAJMIN" | cut -d. -f1)"
+fi
+# xz ve zstd gerekebilir
+command -v xz   >/dev/null 2>&1 || APT_INSTALL xz-utils
+command -v zstd >/dev/null 2>&1 || APT_INSTALL zstd
+
+# kmodsign yolunu kesinleştir
+if [ -x "/usr/lib/linux-kbuild-$KMAJMIN/kmodsign" ]; then
+  KSIGN="/usr/lib/linux-kbuild-$KMAJMIN/kmodsign"
+elif command -v kmodsign >/dev/null 2>&1; then
+  KSIGN="$(command -v kmodsign)"
+else
+  echo "HATA: kmodsign bulunamadı. linux-kbuild paketinin kurulumu başarısız."
+  exit 1
 fi
 
-# ---- NVIDIA modül dizin adayları ----
+# --- NVIDIA modül dizin adayları ---
 DIRS=(
   "/lib/modules/$KREL/updates/dkms"
   "/lib/modules/$KREL/extra"
@@ -36,7 +57,7 @@ DIRS=(
   "/lib/modules/$KREL/kernel/drivers/gpu"
 )
 
-# Modülleri topla
+# Modülleri topla (.ko / .ko.xz / .ko.zst)
 mods=()
 for d in "${DIRS[@]}"; do
   [ -d "$d" ] || continue
@@ -48,7 +69,7 @@ if [ "${#mods[@]}" -eq 0 ]; then
   exit 2
 fi
 
-# Varsa sıkıştırılmışları aç
+# Sıkıştırılmışları aç
 need_zstd=false
 for f in "${mods[@]}"; do
   case "$f" in
@@ -56,9 +77,9 @@ for f in "${mods[@]}"; do
     *.ko.zst) echo "Açılıyor: $f"; if command -v zstd >/dev/null 2>&1; then zstd -df "$f"; else need_zstd=true; fi ;;
   esac
 done
-$need_zstd && { echo "HATA: .zst dosyası var ama zstd yok. Kur: apt install -y zstd"; exit 1; }
+$need_zstd && { echo "HATA: .zst var ama zstd kurulumunda sorun oluştu."; exit 1; }
 
-# Yeniden sadece .ko'ları listele
+# Sadece .ko'ları yeniden listele
 mods_ko=()
 for d in "${DIRS[@]}"; do
   [ -d "$d" ] || continue
@@ -72,7 +93,7 @@ for ko in "${mods_ko[@]}"; do
   "$KSIGN" sha256 "$KEY_PRIV" "$KEY_DER" "$ko"
 done
 
-# Sistem bilgisi güncelle
+# Sistem bilgilerini güncelle
 depmod -a
 update-initramfs -u
 
