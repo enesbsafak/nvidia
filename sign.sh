@@ -1,26 +1,15 @@
 #!/usr/bin/env bash
-# sign-nvidia-secureboot.sh
-# Debian (12/13) + Secure Boot altında NVIDIA DKMS modüllerini imzalar.
-# İsteğe bağlı: Kernel güncellemesi sonrası otomatik imzalama hook'u kurar.
-#
-# Kullanım:
-#   sudo bash sign-nvidia-secureboot.sh                 # Şimdi imzala
-#   sudo bash sign-nvidia-secureboot.sh --verify        # Sadece imza kontrolü
-#   sudo bash sign-nvidia-secureboot.sh --install-hook  # Kernel postinst hook kur
-#   sudo bash sign-nvidia-secureboot.sh --uninstall-hook# Hook'u kaldır
-#
-# Varsayılan anahtar yolları: $HOME/mok/MOK.priv ve $HOME/mok/MOK.der
-# Farklı yol vermek için:
-#   KEY_PRIV=/yol/MOK.priv KEY_DER=/yol/MOK.der sudo -E bash sign-nvidia-secureboot.sh
+# sign.sh - Debian 13 + Secure Boot için NVIDIA DKMS modüllerini imzalar.
+# Tek komut: sudo bash ./sign.sh
 
 set -euo pipefail
 
-# === Ayarlar ===
-KEY_PRIV="${KEY_PRIV:-$HOME/mok/MOK.priv}"
-KEY_DER="${KEY_DER:-$HOME/mok/MOK.der}"
+# --- Sana göre sabit yollar ---
+KEY_PRIV="/home/safakb/mok/MOK.priv"
+KEY_DER="/home/safakb/mok/MOK.der"
 
+# --- Genel ayarlar ---
 KREL="$(uname -r)"
-# DKMS modülleri genelde burada; yine de birden fazla konumu tarıyoruz:
 CANDIDATE_DIRS=(
   "/lib/modules/$KREL/updates/dkms"
   "/lib/modules/$KREL/extra"
@@ -28,179 +17,96 @@ CANDIDATE_DIRS=(
   "/lib/modules/$KREL/kernel/drivers/gpu"
 )
 
-HOOK_PATH="/etc/kernel/postinst.d/zz-nvidia-secureboot-sign"
-SELF="$(readlink -f "$0")"
-
 log(){ printf "\033[1;34m[*]\033[0m %s\n" "$*"; }
 ok(){  printf "\033[1;32m[+]\033[0m %s\n" "$*"; }
 warn(){printf "\033[1;33m[!]\033[0m %s\n" "$*"; }
 err(){ printf "\033[1;31m[x]\033[0m %s\n" "$*" >&2; }
 
-need_root(){
-  if [[ $EUID -ne 0 ]]; then
-    err "Root gerekli. 'sudo bash $SELF' şeklinde çalıştır."
-    exit 1
-  fi
-}
-
-check_prereqs(){
-  command -v kmodsign >/dev/null 2>&1 || {
-    err "kmodsign bulunamadı. Kurulum için: sudo apt update && sudo apt install -y kmod"
-    exit 1
-  }
-  [[ -f "$KEY_PRIV" && -f "$KEY_DER" ]] || {
-    err "Anahtar(lar) bulunamadı:
+# --- Ön kontrol ---
+command -v kmodsign >/dev/null 2>&1 || err "kmodsign bulunamadı. 'sudo apt update && sudo apt install -y kmod' ile kur."
+[[ -f "$KEY_PRIV" && -f "$KEY_DER" ]] || err "Anahtar(lar) yok:
   KEY_PRIV: $KEY_PRIV
   KEY_DER : $KEY_DER
-Not: MOK anahtarını önceden 'mokutil --import' ile enroll etmiş olmalısın."
-    exit 1
-  }
-}
+MOK anahtarını önceden 'mokutil --import' ile enroll etmiş olmalısın."
+command -v xz >/dev/null 2>&1 || warn "xz komutu bulunamadı (xz sıkıştırılmış modül varsa gerekli). 'sudo apt install -y xz-utils'."
+command -v zstd >/dev/null 2>&1 || warn "zstd komutu yoksa .zst açılmaz. 'sudo apt install -y zstd'."
 
-find_modules(){
-  # nvidia.ko, nvidia-*.ko, nvidia-peermem.ko vb.; sıkıştırılmış olanları da yakala
+# --- Modülleri bul ---
+find_modules() {
   local found=()
   for d in "${CANDIDATE_DIRS[@]}"; do
     [[ -d "$d" ]] || continue
-    while IFS= read -r p; do found+=("$p"); done < <(find "$d" -type f \( -name "nvidia*.ko" -o -name "nvidia*.ko.xz" -o -name "nvidia*.ko.zst" \) 2>/dev/null || true)
+    while IFS= read -r p; do found+=("$p"); done < <(
+      find "$d" -type f \( -name "nvidia*.ko" -o -name "nvidia*.ko.xz" -o -name "nvidia*.ko.zst" \) 2>/dev/null || true
+    )
   done
   printf '%s\n' "${found[@]}" | sort -u
 }
 
-decompress_if_needed(){
+# --- Sıkıştırılmış ise aç ---
+decompress_if_needed() {
   local f="$1"
   case "$f" in
     *.ko) echo "$f";;
     *.ko.xz)
-      log "Açılıyor: $f"
-      xz -df "$f"
+      log "Açılıyor (xz): $f"
+      sudo xz -df "$f"
       echo "${f%.xz}"
       ;;
     *.ko.zst)
       if command -v zstd >/dev/null 2>&1; then
-        log "Açılıyor: $f"
-        zstd -df "$f"
+        log "Açılıyor (zstd): $f"
+        sudo zstd -df "$f"
         echo "${f%.zst}"
       else
-        err "zstd yok ama .zst dosyası var: $f  -> sudo apt install -y zstd"
-        exit 1
+        err "zstd yok: $f açılamaz. 'sudo apt install -y zstd'."
       fi
       ;;
     *)
-      err "Tanınmayan uzantı: $f"; exit 1;;
+      err "Tanınmayan modül: $f"
+      ;;
   esac
 }
 
-sign_module(){
+# --- İmzalama + Doğrulama ---
+sign_one() {
   local ko="$1"
   log "İmzalanıyor: $ko"
-  kmodsign sha256 "$KEY_PRIV" "$KEY_DER" "$ko"
+  sudo kmodsign sha256 "$KEY_PRIV" "$KEY_DER" "$ko"
 }
 
-verify_module(){
+verify_one() {
   local ko="$1"
-  local s
-  s="$(modinfo "$ko" 2>/dev/null | grep -m1 '^signer' || true)"
-  if [[ -n "$s" ]]; then
-    ok "$(basename "$ko") -> $s"
-  else
-    warn "$(basename "$ko") -> signer bilgisi yok"
-  fi
+  local s; s="$(modinfo "$ko" 2>/dev/null | grep -m1 '^signer' || true)"
+  if [[ -n "$s" ]]; then ok "$(basename "$ko") -> $s"; else warn "$(basename "$ko") -> signer yok"; fi
 }
 
-run_sign(){
-  need_root
-  check_prereqs
-
-  local mods raw ko signed=0
-  raw="$(find_modules || true)"
-  if [[ -z "$raw" ]]; then
-    err "İmzalanacak NVIDIA modülü bulunamadı. DKMS kurulumu doğru mu? (nvidia-driver / nvidia-dkms paketi)"
-    exit 2
-  fi
-
-  mapfile -t mods <<<"$raw"
+# --- Çalıştır ---
+main() {
+  log "NVIDIA modülleri aranıyor (kernel: $KREL)…"
+  mapfile -t MODS_RAW < <(find_modules)
+  [[ ${#MODS_RAW[@]} -gt 0 ]] || err "İmzalanacak NVIDIA modülü bulunamadı. (nvidia-dkms/nvidia-driver kurulu mu?)"
 
   declare -a KO_LIST=()
-  for m in "${mods[@]}"; do
-    ko="$(decompress_if_needed "$m")"
-    KO_LIST+=("$ko")
+  for m in "${MODS_RAW[@]}"; do
+    KO_LIST+=("$(decompress_if_needed "$m")")
   done
 
   for ko in "${KO_LIST[@]}"; do
-    sign_module "$ko" && ((signed++)) || warn "İmzalanamadı: $ko"
+    [[ -f "$ko" ]] || { warn "Dosya yok: $ko"; continue; }
+    sign_one "$ko"
   done
 
   log "depmod + initramfs güncelleniyor…"
-  depmod -a
-  update-initramfs -u
+  sudo depmod -a
+  sudo update-initramfs -u
 
-  ok "$signed adet modül imzalandı."
   log "Doğrulama:"
-  for ko in "${KO_LIST[@]}"; do verify_module "$ko"; done
+  for ko in "${KO_LIST[@]}"; do
+    [[ -f "$ko" ]] && verify_one "$ko"
+  done
 
   ok "Bitti. Gerekirse: sudo reboot"
 }
 
-install_hook(){
-  need_root
-  check_prereqs
-
-  cat > "$HOOK_PATH" <<'HOOK'
-#!/usr/bin/env bash
-# Kernel güncellemesi sonrası NVIDIA modüllerini imzala (Secure Boot)
-set -euo pipefail
-
-KEY_PRIV="${KEY_PRIV:-/root/mok/MOK.priv}"
-KEY_DER="${KEY_DER:-/root/mok/MOK.der}"
-
-SELF_SCRIPT="/usr/local/sbin/sign-nvidia-secureboot.sh"
-
-if [[ -x "$SELF_SCRIPT" ]]; then
-  # Anahtarlar root altında değilse HOME altını dene (yaygın kullanım)
-  if [[ ! -f "$KEY_PRIV" || ! -f "$KEY_DER" ]]; then
-    KEY_PRIV="${KEY_PRIV:-$HOME/mok/MOK.priv}"
-    KEY_DER="${KEY_DER:-$HOME/mok/MOK.der}"
-  fi
-  KEY_PRIV="$KEY_PRIV" KEY_DER="$KEY_DER" bash "$SELF_SCRIPT" >/var/log/nvidia-secureboot-sign.log 2>&1 || true
-fi
-HOOK
-
-  chmod +x "$HOOK_PATH"
-
-  # Script’i sisteme kopyala ki hook çalıştırabilsin:
-  install -Dm755 "$SELF" /usr/local/sbin/sign-nvidia-secureboot.sh
-
-  ok "Hook kuruldu: $HOOK_PATH"
-  ok "Bu makinada kernel güncellemesinden sonra otomatik imzalama çalışacaktır."
-}
-
-uninstall_hook(){
-  need_root
-  rm -f "$HOOK_PATH" /usr/local/sbin/sign-nvidia-secureboot.sh
-  ok "Hook ve yardımcı script kaldırıldı."
-}
-
-verify_only(){
-  local raw mods
-  raw="$(find_modules || true)"
-  if [[ -z "$raw" ]]; then
-    err "Modül bulunamadı."
-    exit 2
-  fi
-  mapfile -t mods <<<"$raw"
-  for m in "${mods[@]}"; do
-    [[ "$m" == *.xz || "$m" == *.zst ]] && warn "$(basename "$m") sıkıştırılmış; önce imzalama gerekir."
-    [[ "$m" == *.ko ]] && verify_module "$m"
-  done
-}
-
-case "${1:-}" in
-  --install-hook)   install_hook ;;
-  --uninstall-hook) uninstall_hook ;;
-  --verify)         verify_only ;;
-  ""|--run)         run_sign ;;
-  *) err "Geçersiz seçenek: $1
-Kullanım: $0 [--install-hook | --uninstall-hook | --verify]
-Varsayılan (parametresiz): imzalama işlemini yapar."; exit 1;;
-esac
+main
